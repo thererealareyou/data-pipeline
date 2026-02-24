@@ -1,88 +1,84 @@
-import pandas as pd
-import torch
-from datasets import Dataset
-
+import logging
 from sentence_transformers import (
     SentenceTransformer,
     SentenceTransformerTrainer,
     SentenceTransformerTrainingArguments,
 )
-from sentence_transformers.losses import MultipleNegativesRankingLoss
+
+import pandas # По какой-то причине pd не принимает PyCharm :?
+
 from sentence_transformers.evaluation import InformationRetrievalEvaluator
-from transformers import Adafactor
+from sentence_transformers.training_args import BatchSamplers
+from sentence_transformers.losses import MultipleNegativesRankingLoss
+from peft import LoraConfig, get_peft_model
+
+import config
+
+from trainer_utils import (
+    set_seed,
+    load_triplets_dataset,
+    prepare_ir_evaluator_data,
+    MetricsLoggerCallback,
+    plot_metrics_csv
+)
+
+logger = logging.getLogger(__name__)
 
 
-def main():
-    torch.cuda.empty_cache()
+def train_lora():
+    set_seed(42)
 
+    try:
+        train_dataset = load_triplets_dataset(config.CSV_TRAIN_FILENAME_TRIPLETS)
 
-    df_train = pd.read_csv("ОбучающийТриплет.csv", sep="|", encoding="utf-8")
-    df_test  = pd.read_csv("ТестовыйТриплет.csv",  sep="|", encoding="utf-8")
+        df_train = pandas.read_csv(config.CSV_TRAIN_FILENAME_TRIPLETS, sep=config.CSV_DELIMITER, encoding="utf-8")
+        df_test = pandas.read_csv(config.CSV_TEST_FILENAME_TRIPLETS, sep=config.CSV_DELIMITER, encoding="utf-8")
 
-    train_dataset = Dataset.from_dict({
-        "anchor":   df_train["anchor"].astype(str).tolist(),
-        "positive": df_train["positive"].astype(str).tolist(),
-        "negative": df_train["negative"].astype(str).tolist(),
-    })
+        logger.info("Инициализация модели для LoRA.")
+        model = SentenceTransformer(config.EMBEDDING_MODEL_NAME, trust_remote_code=True)
+        model[0].auto_model.gradient_checkpointing_enable()
 
+        peft_config = LoraConfig(**config.CURRENT_LORA_CONFIG)
+        model[0].auto_model = get_peft_model(model[0].auto_model, peft_config)
+        model[0].auto_model.print_trainable_parameters()
 
-    model = SentenceTransformer("ai-forever/FRIDA")
+        loss = MultipleNegativesRankingLoss(model)
 
-    model[0].auto_model.gradient_checkpointing_enable()
+        logger.info("Подготовка эвалуаторов.")
+        test_q, test_c, test_r = prepare_ir_evaluator_data(df_test, prefix="test_")
+        evaluator_test = InformationRetrievalEvaluator(test_q, test_c, test_r, name="lora_TEST")
 
-    loss = MultipleNegativesRankingLoss(model)
+        train_q, train_c, train_r = prepare_ir_evaluator_data(df_train, prefix="train_")
+        evaluator_train = InformationRetrievalEvaluator(train_q, train_c, train_r, name="lora_TRAIN")
 
-    test_queries, test_corpus, test_relevant = {}, {}, {}
-    for idx, row in df_test.iterrows():
-        qid    = f"q{idx}"
-        doc_id = f"doc{idx}"
-        test_queries[qid]  = str(row["anchor"])
-        test_corpus[doc_id] = str(row["positive"])
-        test_relevant[qid]  = {doc_id}
+        metrics_callback = MetricsLoggerCallback()
 
-    evaluator = InformationRetrievalEvaluator(
-        test_queries, test_corpus, test_relevant, name="rag_eval"
-    )
+        args = SentenceTransformerTrainingArguments(
+            **config.CURRENT_TRAINING_CONFIG,
+            batch_sampler=BatchSamplers.NO_DUPLICATES
+        )
 
-    args = SentenceTransformerTrainingArguments(
-        output_dir="./frida-full-ft",
-        num_train_epochs=1,
-        per_device_train_batch_size=4,
-        gradient_accumulation_steps=8,
+        trainer = SentenceTransformerTrainer(
+            model=model,
+            args=args,
+            train_dataset=train_dataset,
+            loss=loss,
+            evaluator=[evaluator_train, evaluator_test],
+            callbacks=[metrics_callback]
+        )
 
-        bf16=True,
-        fp16=False,
+        logger.info("Начало обучения LoRA.")
+        trainer.train()
 
-        optim="adafactor",
-        optim_args="scale_parameter=False,relative_step=False,warmup_init=False",
-        learning_rate=3e-5,
+        logger.info("Сохранение результатов.")
+        model.save_pretrained(config.LORA_FINETUNE_DIR_FINAL)
 
-        max_grad_norm=1.0,
-        warmup_ratio=0.1,
-        weight_decay=0.01,
+        import pandas as pd
+        df_metrics = pd.DataFrame(metrics_callback.history)
+        if not df_metrics.empty:
+            df_metrics.to_csv(config.TRAINING_METRICS_LOG, index=False)
+            plot_metrics_csv(config.TRAINING_METRICS_LOG, config.TRAINING_METRICS_PLOT)
 
-        logging_steps=50,
-        eval_strategy="steps",
-        eval_steps=50,
-        save_strategy="steps",
-        save_steps=50,
-        save_total_limit=2,
-        load_best_model_at_end=True,
-
-        report_to="none",
-    )
-
-    trainer = SentenceTransformerTrainer(
-        model=model,
-        args=args,
-        train_dataset=train_dataset,
-        loss=loss,
-        evaluator=evaluator,
-    )
-
-    trainer.train()
-    model.save_pretrained("./frida-full-ft-final")
-
-
-if __name__ == "__main__":
-    main()
+    except Exception as e:
+        logger.critical(f"Ошибка обучения LoRA: {e}")
+        raise e

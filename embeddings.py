@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import AutoTokenizer, T5EncoderModel
+from transformers import AutoTokenizer, T5EncoderModel, T5Tokenizer, AutoModel
 
 import config
 import logging
@@ -35,7 +35,7 @@ class EmbeddingService:
 
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = T5EncoderModel.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name)
             self.model.eval()
             self.model.to(self.device)
             logger.info("Эмбеддинговая модель успешно загружена.")
